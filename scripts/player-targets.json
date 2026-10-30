@@ -1,0 +1,33 @@
+{
+  "targets": [
+    {
+      "name": "Microsoft Media Player",
+      "package": "Microsoft.ZuneMusic",
+      "executables": [
+        "Microsoft.Media.Player.exe"
+      ],
+      "enabled": true,
+      "status": "Monitored through the unified player hook task"
+    },
+    {
+      "name": "Movies & TV",
+      "package": "Microsoft.ZuneVideo",
+      "executables": [
+        "Video.UI.exe"
+      ],
+      "enabled": true,
+      "status": "Validated pipeline; FEL still requires independent testing"
+    },
+    {
+      "name": "Photos",
+      "package": "Microsoft.Windows.Photos",
+      "executables": [
+        "Microsoft.Photos.exe",
+        "Photos.exe"
+      ],
+      "enabled": true,
+      "status": "Experimental: process detection and loading only, Dolby Vision not validated"
+    }
+  ],
+  "notes": "All three supported players are monitored by the single player hook task. Existing Microsoft Media Player hook binaries are preserved."
+}
