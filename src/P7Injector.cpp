@@ -70,7 +70,11 @@ static uintptr_t ResolveRemoteProc(DWORD pid, FARPROC proc, std::wstring& ownerM
     const uintptr_t localBase = reinterpret_cast<uintptr_t>(localModule);
     const uintptr_t localProc = reinterpret_cast<uintptr_t>(proc);
     const uintptr_t rva = localProc - localBase;
-    const uintptr_t remoteBase = FindRemoteModuleBase(pid, ownerModule);
+    uintptr_t remoteBase = 0;
+    for (int attempt = 0; attempt < 12 && !remoteBase; ++attempt) {
+        remoteBase = FindRemoteModuleBase(pid, ownerModule);
+        if (!remoteBase) Sleep(25);
+    }
     if (!remoteBase) return 0;
 
     return remoteBase + rva;

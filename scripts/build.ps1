@@ -46,6 +46,8 @@ if (-not (Test-Path (Join-Path $mhRoot 'include\MinHook.h'))) {
 }
 
 $dllSrc = Join-Path $src 'P7ProfileHook.cpp'
+$vpSrc = Join-Path $src 'Hdr10VideoProcessorBridge.cpp'
+$vpAbiSrc = Join-Path $src 'Hdr10VideoProcessorCAbi.c'
 $exeSrc = Join-Path $src 'P7Injector.cpp'
 $dllOut = Join-Path $out 'P7ProfileHook.dll'
 $exeOut = Join-Path $out 'P7Injector.exe'
@@ -58,15 +60,45 @@ $hook = Join-Path $mhSrc 'hook.c'
 $trampoline = Join-Path $mhSrc 'trampoline.c'
 $hde64 = Join-Path $hde 'hde64.c'
 
-$cmd1 = 'call "' + $vcvars + '" && cl /nologo /std:c++17 /O2 /Oi /Ot /GL /arch:AVX2 /openmp /EHsc /W4 /LD /I"' + $inc + '" /I"' + $mhSrc + '" /I"' + $hde + '" "' + $dllSrc + '" "' + $buffer + '" "' + $hook + '" "' + $trampoline + '" "' + $hde64 + '" /link /LTCG /OUT:"' + $dllOut + '" mfplat.lib mfuuid.lib ole32.lib d3d11.lib dxgi.lib d3dcompiler.lib'
-cmd.exe /d /s /c $cmd1
-if ($LASTEXITCODE -ne 0) { throw "Hook DLL build failed: $LASTEXITCODE" }
+$cmd1 = 'call "' + $vcvars + '" && cl /nologo /std:c++17 /O2 /Oi /Ot /GL /arch:AVX2 /openmp /EHsc /W4 /LD /I"' + $inc + '" /I"' + $mhSrc + '" /I"' + $hde + '" "' + $dllSrc + '" "' + $vpSrc + '" "' + $vpAbiSrc + '" "' + $buffer + '" "' + $hook + '" "' + $trampoline + '" "' + $hde64 + '" /link /LTCG /OUT:"' + $dllOut + '" mfplat.lib mfuuid.lib ole32.lib d3d11.lib dxgi.lib d3dcompiler.lib user32.lib dxguid.lib'
+$hookBuildLog = Join-Path $out 'P7ProfileHook-build.log'
+$hookBuildCommand = $cmd1 + ' 2>&1'
+Write-Host ('Compiling hook; compiler output: ' + $hookBuildLog) -ForegroundColor Cyan
+$hookBuildOutput = & cmd.exe /d /s /c $hookBuildCommand
+$hookBuildExitCode = $LASTEXITCODE
+@($hookBuildOutput) | Set-Content -LiteralPath $hookBuildLog -Encoding UTF8
+$hookBuildOutput | Out-Host
+if ($hookBuildExitCode -ne 0) {
+    Write-Host ''
+    Write-Host 'MSVC errors (from full compiler output):' -ForegroundColor Red
+    $errors = @($hookBuildOutput | Select-String -Pattern '(^|\s)(fatal error|error) (C\d+|LNK\d+|D\d+)|fatal error|undefined reference|unresolved external|warning LNK')
+    if ($errors.Count -gt 0) {
+        $errors | Select-Object -First 40 | ForEach-Object { Write-Host $_ -ForegroundColor Red }
+    } else {
+        Write-Host 'No compiler error line matched. Please send the complete log file.' -ForegroundColor Yellow
+    }
+    throw ('Hook DLL build failed: ' + $hookBuildExitCode + '. Full log: ' + $hookBuildLog)
+}
 
 $cmd2 = 'call "' + $vcvars + '" && cl /nologo /std:c++17 /O2 /EHsc /W4 "' + $exeSrc + '" /link /SUBSYSTEM:CONSOLE /OUT:"' + $exeOut + '"'
 cmd.exe /d /s /c $cmd2
 if ($LASTEXITCODE -ne 0) { throw "Injector build failed: $LASTEXITCODE" }
 
+$probeSrc = Join-Path $src 'P7MediaProbe.cpp'
+$probeOut = Join-Path $out 'P7MediaProbe.exe'
+$cmd3 = 'call "' + $vcvars + '" && cl /nologo /std:c++17 /O2 /EHsc /W4 /I"' + $src + '" "' + $probeSrc + '" /link /SUBSYSTEM:CONSOLE /OUT:"' + $probeOut + '" ole32.lib shell32.lib uuid.lib'
+cmd.exe /d /s /c $cmd3
+if ($LASTEXITCODE -ne 0) { throw "Media preflight helper build failed: $LASTEXITCODE" }
+
+$hdrSource = Join-Path $src 'P7HdrOutputCheck.cpp'
+$hdrOutput = Join-Path $out 'P7HdrOutputCheck.exe'
+$hdrCommand = 'call "' + $vcvars + '" && cl /nologo /std:c++17 /O2 /EHsc /W4 "' + $hdrSource + '" /link /SUBSYSTEM:CONSOLE /OUT:"' + $hdrOutput + '" dxgi.lib'
+cmd.exe /d /s /c $hdrCommand
+if ($LASTEXITCODE -ne 0) { throw "HDR output checker build failed: $LASTEXITCODE" }
+
 Write-Host ''
-Write-Host 'BUILT Version 1.0-beta:' -ForegroundColor Green
+Write-Host 'BUILT Version 1.0-beta:'  -ForegroundColor Green
 Write-Host $dllOut
 Write-Host $exeOut
+Write-Host $probeOut
+Write-Host $hdrOutput

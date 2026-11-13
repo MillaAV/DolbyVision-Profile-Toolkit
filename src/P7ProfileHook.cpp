@@ -1,4 +1,4 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <mfapi.h>
@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <cwchar>
+#include <cstdlib>
 #include <cstdarg>
 #include <cstring>
 #include <cmath>
@@ -27,6 +28,10 @@
 #include <omp.h>
 #endif
 #include "MinHook.h"
+#include "DvWindowsPreflight.h"
+#include "Hdr10SeiRewriter.h"
+#include "Hdr10DisplayQuery.h"
+#include "Hdr10ToneMapMath.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -43,8 +48,12 @@ using SetOutputTypeFn = HRESULT (STDMETHODCALLTYPE*)(IMFTransform*, DWORD, IMFMe
 using ProcessInputFn = HRESULT (STDMETHODCALLTYPE*)(IMFTransform*, DWORD, IMFSample*, DWORD);
 using ProcessOutputFn = HRESULT (STDMETHODCALLTYPE*)(IMFTransform*, DWORD, DWORD, MFT_OUTPUT_DATA_BUFFER*, DWORD*);
 using ProcessMessageFn = HRESULT (STDMETHODCALLTYPE*)(IMFTransform*, MFT_MESSAGE_TYPE, ULONG_PTR);
+using CreateFileWFn = HANDLE (WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using CreateFile2Fn = HANDLE (WINAPI*)(LPCWSTR, DWORD, DWORD, DWORD, LPCREATEFILE2_EXTENDED_PARAMETERS);
 
 static MFTEnumExFn g_originalMFTEnumEx = nullptr;
+static CreateFileWFn g_originalCreateFileW = nullptr;
+static CreateFile2Fn g_originalCreateFile2 = nullptr;
 static SetInputTypeFn g_originalHevcSetInputType = nullptr;
 static SetOutputTypeFn g_originalHevcSetOutputType = nullptr;
 static ProcessInputFn g_originalHevcProcessInput = nullptr;
@@ -104,6 +113,7 @@ static HMODULE g_selfModule = nullptr;
 static HMODULE g_doviModule = nullptr;
 static SRWLOCK g_doviLock = SRWLOCK_INIT;
 
+static bool LoggingEnabled();
 static void Log(const wchar_t* fmt, ...);
 static bool ReadFriendlyName(IMFActivate* activate, wchar_t* name, UINT32 cch);
 
@@ -2538,6 +2548,7 @@ static bool HookSiblingPath(const wchar_t* name, wchar_t* out, size_t chars) {
 }
 
 static bool WriteBinarySibling(const wchar_t* name, const void* data, size_t size) {
+    if (!LoggingEnabled()) return false;
     wchar_t path[32768]{};
     if (!HookSiblingPath(name, path, _countof(path))) return false;
     HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -2644,6 +2655,7 @@ static bool CountP010Low6(
 }
 
 static void WriteReferenceMetadata(LONGLONG sampleTime, const D3D11_TEXTURE2D_DESC& bl, const DecodedElFrame& el, const FelNlqCoeff nlq[3]) {
+    if (!LoggingEnabled()) return;
     wchar_t path[32768]{};
     if (!HookSiblingPath(L"FEL-REF-meta.txt", path, _countof(path))) return;
     HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -5166,7 +5178,33 @@ static void BridgeFel63ToOutput(IMFSample* outputSample) {
 }
 
 
+static bool LoggingEnabled() {
+    static volatile LONG enabled = 0;
+    static volatile LONG64 lastCheck = -100000;
+    const LONGLONG now = static_cast<LONGLONG>(GetTickCount64());
+    const LONGLONG previous = InterlockedCompareExchange64(&lastCheck, 0, 0);
+    if (now - previous >= 500 &&
+        InterlockedCompareExchange64(&lastCheck, now, previous) == previous) {
+        wchar_t flagPath[32768]{};
+        bool active = false;
+        if (g_selfModule && GetModuleFileNameW(g_selfModule, flagPath, _countof(flagPath))) {
+            wchar_t* slash = wcsrchr(flagPath, L'\\');
+            if (slash) {
+                *(slash + 1) = L'\0';
+                if (wcscat_s(flagPath, L"logging.on") == 0) {
+                    const DWORD attrs = GetFileAttributesW(flagPath);
+                    active = attrs != INVALID_FILE_ATTRIBUTES &&
+                        (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+                }
+            }
+        }
+        InterlockedExchange(&enabled, active ? 1 : 0);
+    }
+    return InterlockedCompareExchange(&enabled, 0, 0) != 0;
+}
+
 static void Log(const wchar_t* fmt, ...) {
+    if (!LoggingEnabled()) return;
     AcquireSRWLockExclusive(&g_logLock);
 
     wchar_t logPath[32768]{};
@@ -5354,6 +5392,159 @@ static bool ReadRendererProfile(IMFMediaType* type, wchar_t* profile, UINT32 cch
     profile[0] = 0;
     UINT32 len = 0;
     return SUCCEEDED(type->GetString(kRendererExtensionProfile, profile, cch, &len)) && profile[0] != 0;
+}
+
+static bool InspectMediaTypeDv(IMFMediaType* type, dvprobe::Result& probe) {
+    if (!type) return false;
+    for (const auto& attr : { MF_MT_USER_DATA, MF_MT_MPEG_SEQUENCE_HEADER }) {
+        UINT32 size = 0;
+        if (FAILED(type->GetBlobSize(attr, &size)) || size < 12 || size > 65536) continue;
+        std::vector<unsigned char> data(size);
+        UINT32 actual = 0;
+        if (FAILED(type->GetBlob(attr, data.data(), size, &actual))) continue;
+        const auto result = dvprobe::Inspect(data.data(), actual);
+        if (!result.dolbyVision) continue;
+        probe = result;
+        return true;
+    }
+    return false;
+}
+
+struct PlayerPreflightDecision {
+    int kind = 0;
+    std::wstring path;
+    std::wstring source;
+    dvprobe::Result stream{};
+};
+
+static PlayerPreflightDecision ReadPlayerPreflightDecision() {
+    PlayerPreflightDecision decision{};
+    if (!g_selfModule) return decision;
+    wchar_t processName[32768]{};
+    if (!GetModuleFileNameW(nullptr, processName, _countof(processName))) return decision;
+    const wchar_t* basename = wcsrchr(processName, L'\\');
+    basename = basename ? basename + 1 : processName;
+    if (_wcsicmp(basename, L"Microsoft.Media.Player.exe") != 0 &&
+        _wcsicmp(basename, L"Video.UI.exe") != 0) return decision;
+
+    wchar_t path[32768]{};
+    if (!GetModuleFileNameW(g_selfModule, path, _countof(path))) return decision;
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (!slash) return decision;
+    slash[1] = 0;
+    wchar_t name[80]{};
+    swprintf_s(name, L"preflight-%lu.flag", GetCurrentProcessId());
+    if (wcscat_s(path, name) != 0) return decision;
+
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return decision;
+    FILETIME written{};
+    LARGE_INTEGER length{};
+    const bool valid = GetFileTime(file, nullptr, nullptr, &written) != FALSE &&
+                       GetFileSizeEx(file, &length) != FALSE &&
+                       length.QuadPart >= 32 && length.QuadPart <= 65536 &&
+                       (length.QuadPart % sizeof(wchar_t)) == 0;
+    std::wstring content;
+    if (valid) {
+        content.resize(static_cast<std::size_t>(length.QuadPart) / sizeof(wchar_t));
+        DWORD received = 0;
+        if (!ReadFile(file, content.data(), static_cast<DWORD>(length.QuadPart), &received, nullptr) ||
+            received != static_cast<DWORD>(length.QuadPart)) content.clear();
+    }
+    CloseHandle(file);
+    if (!valid || content.empty()) return decision;
+
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    const ULONGLONG timestamp = (static_cast<ULONGLONG>(written.dwHighDateTime) << 32) | written.dwLowDateTime;
+    const ULONGLONG current = (static_cast<ULONGLONG>(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+    if (current < timestamp || current - timestamp > 25ULL * 1000000ULL) return decision;
+
+    std::vector<std::wstring> parts;
+    std::size_t previous = 0;
+    for (unsigned i = 0; i < 8; ++i) {
+        const auto separator = content.find(L'|', previous);
+        if (separator == std::wstring::npos) return decision;
+        parts.push_back(content.substr(previous, separator - previous));
+        previous = separator + 1;
+    }
+    parts.push_back(content.substr(previous));
+    if (parts.size() != 9 || parts[8].empty() || !dvpreflight::IsMediaPath(parts[8])) return decision;
+
+    const auto decimal = [](const std::wstring& value) -> ULONGLONG {
+        if (value.empty()) return 0;
+        wchar_t* end = nullptr;
+        const ULONGLONG parsed = _wcstoui64(value.c_str(), &end, 10);
+        return end && *end == 0 ? parsed : 0;
+    };
+    if (decimal(parts[1]) != GetCurrentProcessId()) return decision;
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return decision;
+    const ULONGLONG actualStart = (static_cast<ULONGLONG>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+    if (decimal(parts[2]) != actualStart) return decision;
+    if (parts[3] != L"DIRECT" && parts[3] != L"BROKER" && parts[3] != L"RECENT") return decision;
+    if (parts[3] == L"RECENT" && current > actualStart + 5ULL * 10000000ULL) return decision;
+
+    const int kind = parts[0] == L"DV" ? 1 : (parts[0] == L"HEVC" ? 2 : 0);
+    if (!kind || (kind == 1 && decimal(parts[5]) == 0 && decimal(parts[6]) < 2))
+        return decision;
+    const unsigned specifiedProfile = static_cast<unsigned>(decimal(parts[4]));
+    if (kind == 1 && specifiedProfile != 5 && specifiedProfile != 7 &&
+        specifiedProfile != 8 && specifiedProfile != 9) return decision;
+
+    dvprobe::Result verified{};
+    verified.profile = static_cast<unsigned>(decimal(parts[4]));
+    verified.configurationRecords = static_cast<unsigned>(decimal(parts[5]));
+    verified.rpuUnits = static_cast<unsigned>(decimal(parts[6]));
+    verified.enhancementUnits = static_cast<unsigned>(decimal(parts[7]));
+    verified.dolbyVision = kind == 1;
+
+    HANDLE media = CreateFileW(parts[8].c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (media != INVALID_HANDLE_VALUE) {
+        dvprobe::Result inProcess{};
+        const bool inspected = dvpreflight::InspectFileHandle(media, inProcess);
+        CloseHandle(media);
+        if (!inspected || (inProcess.dolbyVision ? 1 : 2) != kind ||
+            decimal(parts[4]) != inProcess.profile ||
+            decimal(parts[5]) != inProcess.configurationRecords ||
+            decimal(parts[6]) != inProcess.rpuUnits ||
+            decimal(parts[7]) != inProcess.enhancementUnits) return decision;
+        verified = inProcess;
+    }
+
+    decision.kind = kind;
+    decision.stream = verified;
+    decision.source = parts[3];
+    decision.path = parts[8];
+    return decision;
+}
+
+static SRWLOCK g_dolbyDecoderProfileLock = SRWLOCK_INIT;
+static std::unordered_map<IMFTransform*, std::wstring> g_dolbyDecoderProfiles;
+
+static void SetActiveDolbyProfile(IMFTransform* transform, const wchar_t* profile) {
+    if (!transform) return;
+    AcquireSRWLockExclusive(&g_dolbyDecoderProfileLock);
+    if (profile && *profile) g_dolbyDecoderProfiles[transform] = profile;
+    else g_dolbyDecoderProfiles.erase(transform);
+    ReleaseSRWLockExclusive(&g_dolbyDecoderProfileLock);
+}
+
+static std::wstring GetActiveDolbyProfile(IMFTransform* transform) {
+    std::wstring profile;
+    if (!transform) return profile;
+    AcquireSRWLockShared(&g_dolbyDecoderProfileLock);
+    const auto it = g_dolbyDecoderProfiles.find(transform);
+    if (it != g_dolbyDecoderProfiles.end()) profile = it->second;
+    ReleaseSRWLockShared(&g_dolbyDecoderProfileLock);
+    return profile;
+}
+
+static bool IsDolbyCandidateDecoder(IMFTransform* transform) {
+    return !GetActiveDolbyProfile(transform).empty();
 }
 
 static bool IsP7CandidateDecoder(IMFTransform* transform) {
@@ -5787,6 +5978,9 @@ static void ResetFelStateForSeek() {
     Log(L"FEL SEEK RESET queues cleared");
 }
 
+static bool IsNativeHdr10Player();
+static void PatchNativeHdr10Sei(IMFTransform*, IMFSample*);
+extern "C" void AttachHdr10VideoDevice(void*);
 static HRESULT STDMETHODCALLTYPE HookHevcProcessMessage(
     IMFTransform* self,
     MFT_MESSAGE_TYPE message,
@@ -5801,7 +5995,24 @@ static HRESULT STDMETHODCALLTYPE HookHevcProcessMessage(
         ResetFelStateForSeek();
     }
 
-    return g_originalHevcProcessMessage(self, message, param);
+    const HRESULT hr = g_originalHevcProcessMessage(self, message, param);
+    if (SUCCEEDED(hr) && param && message == MFT_MESSAGE_SET_D3D_MANAGER &&
+        IsNativeHdr10Player()) {
+        auto* unknown = reinterpret_cast<IUnknown*>(param);
+        ComPtr<IMFDXGIDeviceManager> manager;
+        if (SUCCEEDED(unknown->QueryInterface(IID_PPV_ARGS(&manager)))) {
+            HANDLE handle = nullptr;
+            if (SUCCEEDED(manager->OpenDeviceHandle(&handle))) {
+                ComPtr<ID3D11Device> device;
+                if (SUCCEEDED(manager->LockDevice(handle, IID_PPV_ARGS(&device), FALSE))) {
+                    if (device) AttachHdr10VideoDevice(device.Get());
+                    manager->UnlockDevice(handle, FALSE);
+                }
+                manager->CloseDeviceHandle(handle);
+            }
+        }
+    }
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE HookHevcProcessInput(
@@ -5815,6 +6026,8 @@ static HRESULT STDMETHODCALLTYPE HookHevcProcessInput(
     if (self == g_elDecoder) {
         return g_originalHevcProcessInput(self, streamId, sample, flags);
     }
+
+    if (sample) PatchNativeHdr10Sei(self, sample);
 
     if (!sample || !g_felBridgeEnabled) {
         return g_originalHevcProcessInput(self, streamId, sample, flags);
@@ -5838,6 +6051,227 @@ static HRESULT STDMETHODCALLTYPE HookHevcProcessInput(
     PumpPrimaryInputs(self);
 
     return S_OK;
+}
+
+static bool IsNativeHdr10Player();
+static volatile LONG g_nativeHdr10ProbeFrames = 0;
+static volatile LONG g_hdr10VideoProcessorActive = 0;
+extern "C" void InstallHdr10VideoProcessorBridge(bool (*)(), float (*)(), void (*)(const wchar_t*, ...));
+extern "C" void AttachHdr10VideoDevice(void*);
+
+static bool Hdr10VideoProcessorActive() {
+    if (!IsNativeHdr10Player() || InterlockedCompareExchange(&g_felContentActive, 0, 0) != 0)
+        return false;
+    AcquireSRWLockShared(&g_dolbyDecoderProfileLock);
+    const bool activeDolby = !g_dolbyDecoderProfiles.empty();
+    ReleaseSRWLockShared(&g_dolbyDecoderProfileLock);
+    return !activeDolby && InterlockedCompareExchange(&g_hdr10VideoProcessorActive, 0, 0) != 0;
+}
+
+static SRWLOCK g_hdr10DisplayCacheLock = SRWLOCK_INIT;
+static ULONGLONG g_hdr10DisplayCacheTick = 0;
+static float g_hdr10DisplayCachePeak = 0.0f;
+
+static float Hdr10CurrentDisplayPeak() {
+    const ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&g_hdr10DisplayCacheLock);
+    if (g_hdr10DisplayCacheTick && now - g_hdr10DisplayCacheTick < 2000) {
+        const float peak = g_hdr10DisplayCachePeak;
+        ReleaseSRWLockExclusive(&g_hdr10DisplayCacheLock);
+        return peak;
+    }
+    const Hdr10DisplayQueryResult display = QueryHdr10PlayerDisplay();
+    g_hdr10DisplayCachePeak = display.available && display.hdr10Mode ? display.peakNits : 0.0f;
+    g_hdr10DisplayCacheTick = now;
+    const float peak = g_hdr10DisplayCachePeak;
+    ReleaseSRWLockExclusive(&g_hdr10DisplayCacheLock);
+    return peak;
+}
+
+
+static volatile LONG g_hdr10SeiChanges = 0;
+static volatile LONG g_hdr10SeiNoDisplay = 0;
+
+static void PatchNativeHdr10Sei(IMFTransform* decoder, IMFSample* sample) {
+    if (!sample || !decoder || !Hdr10VideoProcessorActive() ||
+        IsDolbyCandidateDecoder(decoder) || !GetActiveDolbyProfile(decoder).empty() ||
+        GetFileAttributesW(L"C:\\ProgramData\\MillaAV\\P7DV\\hdr10-adaptive.off") != INVALID_FILE_ATTRIBUTES)
+        return;
+
+    const float peak = Hdr10CurrentDisplayPeak();
+    if (!std::isfinite(peak) || peak < 80.0f || peak > 10000.0f) {
+        if (LoggingEnabled() && InterlockedIncrement(&g_hdr10SeiNoDisplay) <= 3)
+            Log(L"HDR10 SEI bypass: no unique HDR display / peak nits");
+        return;
+    }
+
+    IMFMediaBuffer* buffer = nullptr;
+    if (FAILED(sample->ConvertToContiguousBuffer(&buffer)) || !buffer) return;
+    BYTE* bytes = nullptr;
+    DWORD capacity = 0, length = 0;
+    if (FAILED(buffer->Lock(&bytes, &capacity, &length))) {
+        buffer->Release();
+        return;
+    }
+    std::vector<uint8_t> modified;
+    Hdr10Sei::Result result{};
+    const bool changed = bytes && length &&
+        Hdr10Sei::Rewrite(bytes, length, static_cast<unsigned>(std::lround(peak)),
+            modified, result);
+    buffer->Unlock();
+    if (!changed || modified.empty() || modified.size() > MAXDWORD) {
+        buffer->Release();
+        return;
+    }
+
+    IMFMediaBuffer* replacement = nullptr;
+    HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(modified.size()), &replacement);
+    if (FAILED(hr) || !replacement) {
+        buffer->Release();
+        return;
+    }
+    BYTE* destination = nullptr;
+    DWORD allocated = 0, used = 0;
+    hr = replacement->Lock(&destination, &allocated, &used);
+    if (SUCCEEDED(hr)) {
+        if (destination && allocated >= modified.size()) {
+            memcpy(destination, modified.data(), modified.size());
+            hr = replacement->SetCurrentLength(static_cast<DWORD>(modified.size()));
+        } else hr = E_FAIL;
+        replacement->Unlock();
+    }
+    if (SUCCEEDED(hr)) {
+        hr = sample->RemoveAllBuffers();
+        if (SUCCEEDED(hr)) {
+            hr = sample->AddBuffer(replacement);
+            if (FAILED(hr)) sample->AddBuffer(buffer);
+        }
+    }
+    buffer->Release();
+    replacement->Release();
+    if (SUCCEEDED(hr)) {
+        const LONG count = InterlockedIncrement(&g_hdr10SeiChanges);
+        if (LoggingEnabled() && (count <= 12 || count % 100 == 0))
+            Log(L"HDR10 SEI ADAPT patched=%ld originalMaster=%u effectiveMaster=%u CLL=%u displayPeak=%.1f mode=BITSTREAM_METADATA",
+                count, result.originalMasterNits, result.effectiveMasterNits,
+                result.maxCLL, peak);
+    } else if (LoggingEnabled()) {
+        Log(L"HDR10 SEI ADAPT failed to replace sample hr=0x%08X", static_cast<unsigned>(hr));
+    }
+}
+
+static void ProbeNativeHdr10DecodedFrame(IMFTransform* decoder, IMFSample* sample) {
+    if (!decoder || !sample || !LoggingEnabled() || !IsNativeHdr10Player() ||
+        IsDolbyCandidateDecoder(decoder) || !GetActiveDolbyProfile(decoder).empty()) return;
+
+    IMFMediaType* current = nullptr;
+    if (FAILED(decoder->GetOutputCurrentType(0, &current)) || !current) return;
+
+    UINT32 transfer = 0;
+    UINT32 primaries = 0;
+    GUID subtype{};
+    wchar_t rendererProfile[32]{};
+    const bool hdr10 = SUCCEEDED(current->GetGUID(MF_MT_SUBTYPE, &subtype)) &&
+        subtype == MFVideoFormat_P010 &&
+        SUCCEEDED(current->GetUINT32(MF_MT_TRANSFER_FUNCTION, &transfer)) &&
+        transfer == static_cast<UINT32>(MFVideoTransFunc_2084) &&
+        SUCCEEDED(current->GetUINT32(MF_MT_VIDEO_PRIMARIES, &primaries)) &&
+        primaries == 9u &&
+        !ReadRendererProfile(current, rendererProfile, _countof(rendererProfile));
+    current->Release();
+    if (!hdr10) return;
+
+    const LONG frame = InterlockedIncrement(&g_nativeHdr10ProbeFrames);
+    if (frame != 1 && frame != 25 && frame != 73 && frame != 121 && frame != 241) return;
+
+    LONGLONG sampleTime = -1;
+    sample->GetSampleTime(&sampleTime);
+
+    ID3D11Texture2D* source = nullptr;
+    UINT subresource = 0;
+    if (!GetSampleDxgiTexture(sample, &source, &subresource) || !source) {
+        Log(L"NATIVE HDR10 DECODED PIXELS frame=%ld time=%lld result=NO_DXGI_SURFACE",
+            frame, static_cast<long long>(sampleTime));
+        return;
+    }
+    ComPtr<ID3D11Texture2D> texture;
+    texture.Attach(source);
+    D3D11_TEXTURE2D_DESC d{};
+    texture->GetDesc(&d);
+    if (d.Format != DXGI_FORMAT_P010 || d.Width < 2 || d.Height < 2) {
+        Log(L"NATIVE HDR10 DECODED PIXELS frame=%ld result=UNEXPECTED_FORMAT fmt=%u size=%ux%u",
+            frame, static_cast<unsigned>(d.Format), d.Width, d.Height);
+        return;
+    }
+
+    ComPtr<ID3D11Device> device;
+    texture->GetDevice(device.GetAddressOf());
+    if (!device) return;
+    ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(context.GetAddressOf());
+    if (!context) return;
+
+    D3D11_TEXTURE2D_DESC stagingDesc = d;
+    stagingDesc.MipLevels = 1;
+    stagingDesc.ArraySize = 1;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    const HRESULT createHr = device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf());
+    if (FAILED(createHr) || !staging) {
+        Log(L"NATIVE HDR10 DECODED PIXELS frame=%ld result=STAGING_CREATE_FAILED hr=0x%08X",
+            frame, static_cast<unsigned>(createHr));
+        return;
+    }
+
+    context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, texture.Get(), subresource, nullptr);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const HRESULT mapHr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(mapHr) || !mapped.pData) {
+        Log(L"NATIVE HDR10 DECODED PIXELS frame=%ld result=STAGING_MAP_FAILED hr=0x%08X",
+            frame, static_cast<unsigned>(mapHr));
+        return;
+    }
+
+    const BYTE* data = static_cast<const BYTE*>(mapped.pData);
+    UINT32 yMin = 1023;
+    UINT32 yMax = 0;
+    UINT32 sampleCount = 0;
+    UINT32 blackCount = 0;
+    uint64_t ySum = 0;
+    for (UINT32 yi = 0; yi < 16; ++yi) {
+        const UINT32 y = (static_cast<uint64_t>(yi) * (d.Height - 1)) / 15;
+        const auto* row = reinterpret_cast<const uint16_t*>(data + static_cast<size_t>(y) * mapped.RowPitch);
+        for (UINT32 xi = 0; xi < 16; ++xi) {
+            const UINT32 x = (static_cast<uint64_t>(xi) * (d.Width - 1)) / 15;
+            const UINT32 code = row[x] >> 6;
+            yMin = std::min(yMin, code);
+            yMax = std::max(yMax, code);
+            ySum += code;
+            ++sampleCount;
+            if (code == 64) ++blackCount;
+        }
+    }
+    const auto* firstY = reinterpret_cast<const uint16_t*>(data);
+    const auto* centerY = reinterpret_cast<const uint16_t*>(
+        data + static_cast<size_t>(d.Height / 2) * mapped.RowPitch);
+    const UINT32 corner = firstY[0] >> 6;
+    const UINT32 center = centerY[d.Width / 2] >> 6;
+    const auto* uv = reinterpret_cast<const uint16_t*>(
+        data + static_cast<size_t>(d.Height) * mapped.RowPitch);
+    const UINT32 u = uv[0] >> 6;
+    const UINT32 v = uv[1] >> 6;
+    context->Unmap(staging.Get(), 0);
+
+    Log(L"NATIVE HDR10 DECODED PIXELS frame=%ld time=%lld size=%ux%u "
+        L"Ycorner=%u Ycenter=%u Ymin=%u Ymax=%u Yavg=%u Y64=%u/%u UVcorner=%u,%u "
+        L"note=10bit_P010_codes_not_display_nits",
+        frame, static_cast<long long>(sampleTime), d.Width, d.Height,
+        corner, center, yMin, yMax,
+        static_cast<unsigned>(sampleCount ? ySum / sampleCount : 0), blackCount,
+        sampleCount, u, v);
 }
 
 static HRESULT STDMETHODCALLTYPE HookHevcProcessOutput(
@@ -5869,8 +6303,17 @@ static HRESULT STDMETHODCALLTYPE HookHevcProcessOutput(
         }
     }
 
+    if (SUCCEEDED(hr) && outputSamples) {
+        for (DWORD i = 0; i < outputBufferCount; ++i) {
+            if (outputSamples[i].pSample)
+                ProbeNativeHdr10DecodedFrame(self, outputSamples[i].pSample);
+        }
+    }
+
     return hr;
 }
+
+static bool IsMediaPlayerOrMoviesTv();
 
 static HRESULT STDMETHODCALLTYPE HookHevcSetInputType(
     IMFTransform* self, DWORD streamId, IMFMediaType* type, DWORD flags) {
@@ -5891,22 +6334,109 @@ static HRESULT STDMETHODCALLTYPE HookHevcSetInputType(
             p7Candidate = _wcsicmp(existingProfile, L"dvhe.07") == 0;
             Log(L"HEVC SetInputType MKV rendererProfile=%s action=%s",
                 existingProfile, p7Candidate ? L"P7_CANDIDATE" : L"PASSTHROUGH_NATIVE_DV");
+        } else if (!IsMediaPlayerOrMoviesTv()) {
+            auto probe = dvpreflight::InspectActiveMediaFile();
+            if (!probe.inspected && !probe.ambiguous) {
+                const auto recent = dvpreflight::InspectRememberedFile();
+                if (recent.inspected) probe = recent;
+            }
+            dvprobe::Result mediaTypeResult{};
+            if (InspectMediaTypeDv(type, mediaTypeResult)) {
+                probe.inspected = true;
+                probe.stream = mediaTypeResult;
+            }
+            if (probe.inspected && probe.stream.dolbyVision) {
+                ForceP7Profile(type, L"HEVC SetInputType (Photos legacy)");
+                p7Candidate = true;
+                Log(L"HEVC SetInputType PHOTOS_LEGACY_DV profile=%u rpu=%u el=%u",
+                    probe.stream.profile, probe.stream.rpuUnits, probe.stream.enhancementUnits);
+            } else {
+                Log(L"HEVC SetInputType PHOTOS_NATIVE_HEVC found=%s inspected=%s",
+                    probe.foundFile ? L"YES" : L"NO", probe.inspected ? L"YES" : L"NO");
+            }
         } else {
-            ForceP7Profile(type, L"HEVC SetInputType (MKV untagged P7 fallback)");
-            p7Candidate = true;
-            Log(L"HEVC SetInputType MKV rendererProfile=<none> action=P7_FALLBACK");
+            auto probe = dvpreflight::InspectActiveMediaFile();
+            dvprobe::Result mediaTypeResult{};
+            if (!probe.inspected && InspectMediaTypeDv(type, mediaTypeResult)) {
+                probe.inspected = true;
+                probe.stream = mediaTypeResult;
+                dvpreflight::ResolveRpuProfile(probe.stream);
+            }
+            auto staged = ReadPlayerPreflightDecision();
+            if (!probe.inspected && staged.kind == 0 && IsMediaPlayerOrMoviesTv()) {
+                wchar_t executable[MAX_PATH]{};
+                GetModuleFileNameW(nullptr, executable, _countof(executable));
+                const wchar_t* basename = wcsrchr(executable, L'\\');
+                basename = basename ? basename + 1 : executable;
+                int waitedMs = 0;
+                for (int attempt = 0; attempt < 100 && staged.kind == 0; ++attempt) {
+                    Sleep(20);
+                    waitedMs += 20;
+                    staged = ReadPlayerPreflightDecision();
+                }
+                Log(L"PLAYER_PREFLIGHT_WAIT player=%s waitedMs=%d result=%s profile=%u source=%s",
+                    basename, waitedMs, staged.kind == 1 ? L"DOLBY_VISION" :
+                    (staged.kind == 2 ? L"NATIVE_HEVC" : L"UNKNOWN"),
+                    staged.stream.profile,
+                    staged.kind ? staged.source.c_str() : L"<none>");
+            }
+            if (!probe.inspected && staged.kind != 0) {
+                probe.inspected = true;
+                probe.foundFile = true;
+                probe.stream = staged.stream;
+                probe.path = staged.path;
+            }
+            const unsigned detectedProfile = probe.inspected && probe.stream.dolbyVision
+                ? probe.stream.profile : 0;
+            const wchar_t* compatibleProfile = detectedProfile == 5 ? L"dvhe.05" :
+                detectedProfile == 7 ? L"dvhe.07" :
+                detectedProfile == 8 ? L"dvhe.08" : nullptr;
+            if (compatibleProfile) {
+                const HRESULT profileHr = type->SetString(kRendererExtensionProfile, compatibleProfile);
+                p7Candidate = detectedProfile == 7;
+                Log(L"HEVC SetInputType MKV profile=<none> action=CONFIRMED_DOLBY "
+                    L"dvProfile=%u renderer=%s hr=0x%08X configs=%u rpu=%u el=%u source=%s path=%s",
+                    detectedProfile, compatibleProfile, static_cast<unsigned>(profileHr),
+                    probe.stream.configurationRecords, probe.stream.rpuUnits,
+                    probe.stream.enhancementUnits,
+                    probe.foundFile ? (staged.kind ? staged.source.c_str() : L"DIRECT") : L"MEDIA_TYPE",
+                    probe.path.c_str());
+            } else {
+                Log(L"HEVC SetInputType MKV profile=<none> action=NATIVE_HEVC "
+                    L"found=%s inspected=%s ambiguous=%s rpu=%u profile=%u source=%s path=%s",
+                    probe.foundFile ? L"YES" : L"NO",
+                    probe.inspected ? L"YES" : L"NO",
+                    probe.ambiguous ? L"YES" : L"NO",
+                    probe.stream.rpuUnits, detectedProfile,
+                    staged.kind ? staged.source.c_str() : L"IN_PROCESS",
+                    probe.path.empty() ? L"<none>" : probe.path.c_str());
+            }
         }
 
-        SetP7CandidateDecoder(self, p7Candidate);
+        if ((flags & MFT_SET_TYPE_TEST_ONLY) == 0) {
+            SetP7CandidateDecoder(self, p7Candidate);
+            wchar_t agreedProfile[32]{};
+            if (ReadRendererProfile(type, agreedProfile, _countof(agreedProfile)) &&
+                (_wcsicmp(agreedProfile, L"dvhe.05") == 0 ||
+                 _wcsicmp(agreedProfile, L"dvhe.07") == 0 ||
+                 _wcsicmp(agreedProfile, L"dvhe.08") == 0))
+                SetActiveDolbyProfile(self, agreedProfile);
+            else SetActiveDolbyProfile(self, nullptr);
+        }
 
-        if (p7Candidate) {
-            HRESULT naluHr = type->SetUINT32(kForwardCustomNalu, kDolbyVisionHevcNaluType);
-            HRESULT orderHr = type->SetUINT32(kForwardCustomSeiDecodeOrder, TRUE);
+        wchar_t forwardingProfile[32]{};
+        const bool forwardDolbyRpu = ReadRendererProfile(type, forwardingProfile,
+            _countof(forwardingProfile)) &&
+            (_wcsicmp(forwardingProfile, L"dvhe.05") == 0 ||
+             _wcsicmp(forwardingProfile, L"dvhe.07") == 0 ||
+             _wcsicmp(forwardingProfile, L"dvhe.08") == 0);
+        if (forwardDolbyRpu) {
+            const HRESULT naluHr = type->SetUINT32(kForwardCustomNalu, kDolbyVisionHevcNaluType);
+            const HRESULT orderHr = type->SetUINT32(kForwardCustomSeiDecodeOrder, TRUE);
 
-            Log(L"FORCE MF_MT_FORWARD_CUSTOM_NALU=62 hr=0x%08X",
-                static_cast<unsigned>(naluHr));
-            Log(L"FORCE MF_DECODER_FWD_CUSTOM_SEI_DECODE_ORDER=1 hr=0x%08X",
-                static_cast<unsigned>(orderHr));
+            Log(L"DOLBY RPU FORWARD profile=%s nalu62Hr=0x%08X decodeOrderHr=0x%08X p7FEL=%s",
+                forwardingProfile, static_cast<unsigned>(naluHr),
+                static_cast<unsigned>(orderHr), p7Candidate ? L"YES" : L"NO");
         }
     }
 
@@ -5914,6 +6444,10 @@ static HRESULT STDMETHODCALLTYPE HookHevcSetInputType(
         ? g_originalHevcSetInputType(self, streamId, type, flags)
         : E_UNEXPECTED;
 
+    if (FAILED(hr) && mkvHevc && (flags & MFT_SET_TYPE_TEST_ONLY) == 0) {
+        SetP7CandidateDecoder(self, false);
+        SetActiveDolbyProfile(self, nullptr);
+    }
     if (mkvHevc) {
         Log(L"HEVC SetInputType original returned hr=0x%08X flags=0x%08X self=%p p7Candidate=%s",
             static_cast<unsigned>(hr), flags, self, p7Candidate ? L"YES" : L"NO");
@@ -5923,27 +6457,333 @@ static HRESULT STDMETHODCALLTYPE HookHevcSetInputType(
     return hr;
 }
 
+static bool IsMediaPlayerOrMoviesTv() {
+    wchar_t processName[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, processName, _countof(processName))) return false;
+    const wchar_t* basename = wcsrchr(processName, L'\\');
+    basename = basename ? basename + 1 : processName;
+    return _wcsicmp(basename, L"Microsoft.Media.Player.exe") == 0 ||
+           _wcsicmp(basename, L"Video.UI.exe") == 0;
+}
+
+static void LogVideoColorimetry(IMFMediaType* type, const wchar_t* stage) {
+    if (!type) return;
+    UINT32 transfer = 0xFFFFFFFFu;
+    UINT32 primaries = 0xFFFFFFFFu;
+    UINT32 matrix = 0xFFFFFFFFu;
+    UINT32 range = 0xFFFFFFFFu;
+    type->GetUINT32(MF_MT_TRANSFER_FUNCTION, &transfer);
+    type->GetUINT32(MF_MT_VIDEO_PRIMARIES, &primaries);
+    type->GetUINT32(MF_MT_YUV_MATRIX, &matrix);
+    type->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, &range);
+    Log(L"VIDEO COLORIMETRY %s transfer=%u primaries=%u matrix=%u range=%u "
+        L"PQ=%s BT2020=%s", stage, transfer, primaries, matrix, range,
+        transfer == 15 ? L"YES" : L"NO", primaries == 9 ? L"YES" : L"NO");
+}
+
+static void PreserveNativeHdrColorimetry(IMFTransform* self, IMFMediaType* output, DWORD flags) {
+    if (!IsMediaPlayerOrMoviesTv() || !self || !output ||
+        (flags & MFT_SET_TYPE_TEST_ONLY) != 0 || IsDolbyCandidateDecoder(self)) return;
+    IMFMediaType* input = nullptr;
+    if (FAILED(self->GetInputCurrentType(0, &input)) || !input) return;
+    UINT32 transfer = 0;
+    UINT32 primaries = 0;
+    const bool hdr = SUCCEEDED(input->GetUINT32(MF_MT_TRANSFER_FUNCTION, &transfer)) &&
+                     SUCCEEDED(input->GetUINT32(MF_MT_VIDEO_PRIMARIES, &primaries)) &&
+                     (transfer == 15 || transfer == 16) && primaries == 9;
+    if (hdr) {
+        for (const auto& attribute : { MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_PRIMARIES,
+                                       MF_MT_YUV_MATRIX, MF_MT_VIDEO_NOMINAL_RANGE }) {
+            UINT32 existing = 0;
+            UINT32 value = 0;
+            if (SUCCEEDED(input->GetUINT32(attribute, &value)) &&
+                (FAILED(output->GetUINT32(attribute, &existing)) || existing != value)) {
+                const HRESULT setHr = output->SetUINT32(attribute, value);
+                Log(L"NATIVE HDR COLOR ATTRIBUTE updated hr=0x%08X from=%u to=%u",
+                    static_cast<unsigned>(setHr), existing, value);
+            }
+        }
+        Log(L"NATIVE HDR COLOR ATTRIBUTES preserved transfer=%u primaries=%u", transfer, primaries);
+    }
+    LogVideoColorimetry(input, L"HEVC_INPUT");
+    input->Release();
+}
+
+static void RepairNativeHdrYuvMatrix(IMFTransform* self, IMFMediaType* output, DWORD flags) {
+    if (!self || !output || !IsMediaPlayerOrMoviesTv() ||
+        (flags & MFT_SET_TYPE_TEST_ONLY) != 0 || IsDolbyCandidateDecoder(self) ||
+        !GetActiveDolbyProfile(self).empty() || !IsP010OrNv12(output)) return;
+
+    UINT32 transfer = 0;
+    UINT32 primaries = 0;
+    if (FAILED(output->GetUINT32(MF_MT_TRANSFER_FUNCTION, &transfer)) ||
+        FAILED(output->GetUINT32(MF_MT_VIDEO_PRIMARIES, &primaries)) ||
+        (transfer != static_cast<UINT32>(MFVideoTransFunc_2084) &&
+         transfer != static_cast<UINT32>(MFVideoTransFunc_HLG)) || primaries != 9u) return;
+
+    UINT32 matrix = 0;
+    const bool present = SUCCEEDED(output->GetUINT32(MF_MT_YUV_MATRIX, &matrix));
+    if (present && matrix != static_cast<UINT32>(MFVideoTransferMatrix_Unknown)) {
+        Log(L"NATIVE HDR MATRIX retained explicit=%u transfer=%u primaries=%u",
+            matrix, transfer, primaries);
+        return;
+    }
+
+    const UINT32 corrected = static_cast<UINT32>(MFVideoTransferMatrix_BT2020_10);
+    const HRESULT hr = output->SetUINT32(MF_MT_YUV_MATRIX, corrected);
+    Log(L"NATIVE HDR MATRIX REPAIR previous=%s transfer=%u primaries=%u "
+        L"matrix=%u (BT2020_10) hr=0x%08X",
+        present ? L"UNKNOWN" : L"MISSING", transfer, primaries,
+        corrected, static_cast<unsigned>(hr));
+}
+
+static bool IsNativeHdr10Player() {
+    wchar_t processName[MAX_PATH]{};
+    if (!GetModuleFileNameW(nullptr, processName, _countof(processName))) return false;
+    const wchar_t* base = wcsrchr(processName, L'\\');
+    base = base ? base + 1 : processName;
+    return _wcsicmp(base, L"Microsoft.Media.Player.exe") == 0 ||
+           _wcsicmp(base, L"Video.UI.exe") == 0 ||
+           _wcsicmp(base, L"Microsoft.Photos.exe") == 0 ||
+           _wcsicmp(base, L"Photos.exe") == 0;
+}
+
+static bool IsNativeHdr10Input(IMFTransform* self, IMFMediaType* output) {
+    if (!self || !output || IsDolbyCandidateDecoder(self) ||
+        !GetActiveDolbyProfile(self).empty()) return false;
+    GUID subtype{};
+    if (FAILED(output->GetGUID(MF_MT_SUBTYPE, &subtype)) || subtype != MFVideoFormat_P010)
+        return false;
+    IMFMediaType* input = nullptr;
+    if (FAILED(self->GetInputCurrentType(0, &input)) || !input) return false;
+    UINT32 transfer = 0;
+    UINT32 primaries = 0;
+    wchar_t inputProfile[32]{};
+    wchar_t outputProfile[32]{};
+    const bool hdr10 = !ReadRendererProfile(input, inputProfile, _countof(inputProfile)) &&
+        !ReadRendererProfile(output, outputProfile, _countof(outputProfile)) &&
+        SUCCEEDED(input->GetUINT32(MF_MT_TRANSFER_FUNCTION, &transfer)) &&
+        SUCCEEDED(input->GetUINT32(MF_MT_VIDEO_PRIMARIES, &primaries)) &&
+        transfer == static_cast<UINT32>(MFVideoTransFunc_2084) && primaries == 9u;
+    input->Release();
+    return hdr10;
+}
+
+static void LogNativeHdr10DisplayPlan(IMFTransform* self, IMFMediaType* output, DWORD flags) {
+    if (!self || !output || (flags & MFT_SET_TYPE_TEST_ONLY) != 0 ||
+        !IsNativeHdr10Player() || IsDolbyCandidateDecoder(self) ||
+        !GetActiveDolbyProfile(self).empty()) return;
+
+    GUID subtype{};
+    UINT32 transfer = 0;
+    UINT32 primaries = 0;
+    if (FAILED(output->GetGUID(MF_MT_SUBTYPE, &subtype)) || subtype != MFVideoFormat_P010 ||
+        FAILED(output->GetUINT32(MF_MT_TRANSFER_FUNCTION, &transfer)) ||
+        FAILED(output->GetUINT32(MF_MT_VIDEO_PRIMARIES, &primaries)) ||
+        transfer != static_cast<UINT32>(MFVideoTransFunc_2084) || primaries != 9u)
+        return;
+
+    wchar_t profile[32]{};
+    if (ReadRendererProfile(output, profile, _countof(profile))) return;
+
+    const Hdr10DisplayQueryResult display = QueryHdr10PlayerDisplay();
+    if (!display.available) {
+        Log(L"NATIVE HDR10 DISPLAY unavailable: no matching player window / DXGI output; mode=OBSERVE_ONLY");
+        return;
+    }
+
+    Log(L"NATIVE HDR10 DISPLAY device=%s hdr=%s space=%u max=%.1f min=%.4f fullFrame=%.1f mode=OBSERVE_ONLY",
+        display.deviceName, display.hdr10Mode ? L"YES" : L"NO",
+        static_cast<unsigned>(display.colorSpace), display.peakNits,
+        display.minNits, display.fullFrameNits);
+
+    UINT32 masteringPeak = 0;
+    UINT32 maxCLL = 0;
+    UINT32 maxFALL = 0;
+    const bool haveMastering = SUCCEEDED(output->GetUINT32(MF_MT_MAX_MASTERING_LUMINANCE, &masteringPeak));
+    const bool haveCLL = SUCCEEDED(output->GetUINT32(MF_MT_MAX_LUMINANCE_LEVEL, &maxCLL));
+    const bool haveFALL = SUCCEEDED(output->GetUINT32(MF_MT_MAX_FRAME_AVERAGE_LUMINANCE_LEVEL, &maxFALL));
+    Log(L"NATIVE HDR10 META mastering=%u known=%u maxCLL=%u known=%u maxFALL=%u known=%u",
+        masteringPeak, haveMastering ? 1u : 0u,
+        maxCLL, haveCLL ? 1u : 0u, maxFALL, haveFALL ? 1u : 0u);
+
+    if (!display.hdr10Mode) return;
+    const Hdr10ToneMap::Plan plan = Hdr10ToneMap::MakePlan(
+        {haveMastering ? static_cast<double>(masteringPeak) : 0.0,
+         haveCLL ? static_cast<double>(maxCLL) : 0.0,
+         haveFALL ? static_cast<double>(maxFALL) : 0.0},
+        {static_cast<double>(display.peakNits), static_cast<double>(display.fullFrameNits)});
+    if (!plan.valid) {
+        Log(L"NATIVE HDR10 TONEMAP plan=UNAVAILABLE (missing metadata or display peak) mode=OBSERVE_ONLY");
+        return;
+    }
+    Log(L"NATIVE HDR10 TONEMAP plan=%s sourcePeak=%.1f displayPeak=%.1f knee=%.1f black=%.6f demo1000=%.2f mode=OBSERVE_ONLY",
+        plan.compression ? L"COMPRESS" : L"PASSTHROUGH", plan.sourcePeak,
+        plan.displayPeak, plan.knee, Hdr10ToneMap::MapNits(0.0, plan),
+        Hdr10ToneMap::MapNits(1000.0, plan));
+}
+
+static void RepairNativeHdr10Output(IMFTransform* self, IMFMediaType* output, DWORD flags) {
+    if (!self || !output || (flags & MFT_SET_TYPE_TEST_ONLY) != 0 ||
+        !IsNativeHdr10Player() || !IsNativeHdr10Input(self, output)) return;
+
+    GUID subtype{};
+    if (FAILED(output->GetGUID(MF_MT_SUBTYPE, &subtype)) || subtype != MFVideoFormat_P010) return;
+
+    IMFMediaType* input = nullptr;
+    if (FAILED(self->GetInputCurrentType(0, &input)) || !input) return;
+
+    wchar_t inputProfile[32]{};
+    wchar_t outputProfile[32]{};
+    if (ReadRendererProfile(input, inputProfile, _countof(inputProfile)) ||
+        ReadRendererProfile(output, outputProfile, _countof(outputProfile))) {
+        input->Release();
+        return;
+    }
+
+    UINT32 transfer = 0;
+    UINT32 primaries = 0;
+    const bool hdr10 = SUCCEEDED(input->GetUINT32(MF_MT_TRANSFER_FUNCTION, &transfer)) &&
+        SUCCEEDED(input->GetUINT32(MF_MT_VIDEO_PRIMARIES, &primaries)) &&
+        transfer == static_cast<UINT32>(MFVideoTransFunc_2084) && primaries == 9u;
+    if (!hdr10) {
+        input->Release();
+        return;
+    }
+
+    UINT32 inputRange = 0;
+    UINT32 outputRange = 0;
+    const bool haveInputRange = SUCCEEDED(input->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, &inputRange));
+    const bool haveOutputRange = SUCCEEDED(output->GetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, &outputRange));
+    UINT32 desiredRange = 0;
+    if (haveInputRange && inputRange == static_cast<UINT32>(MFNominalRange_0_255))
+        desiredRange = static_cast<UINT32>(MFNominalRange_0_255);
+    else
+        desiredRange = static_cast<UINT32>(MFNominalRange_16_235);
+
+    if (!haveOutputRange || outputRange != desiredRange) {
+        const HRESULT hr = output->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, desiredRange);
+        Log(L"NATIVE HDR10 RANGE fix input=%u inputKnown=%d output=%u outputKnown=%d desired=%u hr=0x%08X",
+            inputRange, haveInputRange ? 1 : 0, outputRange, haveOutputRange ? 1 : 0,
+            desiredRange, static_cast<unsigned>(hr));
+    }
+
+    UINT32 outputTransfer = 0;
+    if (FAILED(output->GetUINT32(MF_MT_TRANSFER_FUNCTION, &outputTransfer)) ||
+        outputTransfer != static_cast<UINT32>(MFVideoTransFunc_2084))
+        output->SetUINT32(MF_MT_TRANSFER_FUNCTION, static_cast<UINT32>(MFVideoTransFunc_2084));
+    UINT32 outputPrimaries = 0;
+    if (FAILED(output->GetUINT32(MF_MT_VIDEO_PRIMARIES, &outputPrimaries)) || outputPrimaries != 9u)
+        output->SetUINT32(MF_MT_VIDEO_PRIMARIES, 9u);
+
+    UINT32 inputMatrix = 0;
+    UINT32 outputMatrix = 0;
+    const bool haveInputMatrix = SUCCEEDED(input->GetUINT32(MF_MT_YUV_MATRIX, &inputMatrix));
+    const bool haveOutputMatrix = SUCCEEDED(output->GetUINT32(MF_MT_YUV_MATRIX, &outputMatrix));
+    const bool inputIsBt2020OrUnknown = !haveInputMatrix ||
+        inputMatrix == static_cast<UINT32>(MFVideoTransferMatrix_Unknown) ||
+        inputMatrix == static_cast<UINT32>(MFVideoTransferMatrix_BT2020_10);
+    const bool outputIsBt709OrUnknown = !haveOutputMatrix ||
+        outputMatrix == static_cast<UINT32>(MFVideoTransferMatrix_Unknown) ||
+        outputMatrix == static_cast<UINT32>(MFVideoTransferMatrix_BT709);
+    if (inputIsBt2020OrUnknown && outputIsBt709OrUnknown) {
+        const HRESULT hr = output->SetUINT32(MF_MT_YUV_MATRIX,
+            static_cast<UINT32>(MFVideoTransferMatrix_BT2020_10));
+        Log(L"NATIVE HDR10 MATRIX fix input=%u inputKnown=%d output=%u outputKnown=%d desired=4 hr=0x%08X",
+            inputMatrix, haveInputMatrix ? 1 : 0, outputMatrix, haveOutputMatrix ? 1 : 0,
+            static_cast<unsigned>(hr));
+    }
+
+    input->Release();
+}
+
 static HRESULT STDMETHODCALLTYPE HookHevcSetOutputType(
     IMFTransform* self, DWORD streamId, IMFMediaType* type, DWORD flags) {
 
+    struct SavedColorAttribute {
+        const GUID* key;
+        bool present = false;
+        UINT32 value = 0;
+    };
+    std::array<SavedColorAttribute, 4> saved = {{
+        {&MF_MT_TRANSFER_FUNCTION}, {&MF_MT_VIDEO_PRIMARIES},
+        {&MF_MT_YUV_MATRIX}, {&MF_MT_VIDEO_NOMINAL_RANGE}
+    }};
+    const bool nativeTarget = (IsMediaPlayerOrMoviesTv() ||
+        (IsNativeHdr10Player() && IsNativeHdr10Input(self, type))) && type &&
+        (flags & MFT_SET_TYPE_TEST_ONLY) == 0 && !IsDolbyCandidateDecoder(self);
+    if (nativeTarget) {
+        for (auto& entry : saved)
+            entry.present = SUCCEEDED(type->GetUINT32(*entry.key, &entry.value));
+    }
+    PreserveNativeHdrColorimetry(self, type, flags);
+    RepairNativeHdrYuvMatrix(self, type, flags);
+    RepairNativeHdr10Output(self, type, flags);
+    LogNativeHdr10DisplayPlan(self, type, flags);
+    if (IsMediaPlayerOrMoviesTv()) LogVideoColorimetry(type, L"HEVC_OUTPUT_REQUEST");
     HRESULT hr = g_originalHevcSetOutputType
         ? g_originalHevcSetOutputType(self, streamId, type, flags)
         : E_UNEXPECTED;
-
-    if (SUCCEEDED(hr) && type &&
-        IsP7CandidateDecoder(self) &&
-        IsP010OrNv12(type)) {
-
-        wchar_t profile[32]{};
-        UINT32 len = 0;
-        HRESULT getHr = type->GetString(kRendererExtensionProfile, profile, _countof(profile), &len);
-        if (FAILED(getHr) || _wcsicmp(profile, L"dvhe.07") != 0) {
-            ForceP7Profile(type, L"POST HEVC SetOutputType (MKV)");
-        } else {
-            Log(L"HEVC output already carries dvhe.07");
+    if (FAILED(hr) && nativeTarget && g_originalHevcSetOutputType) {
+        bool changed = false;
+        for (const auto& entry : saved) {
+            UINT32 actual = 0;
+            const bool present = SUCCEEDED(type->GetUINT32(*entry.key, &actual));
+            if (present != entry.present || (present && actual != entry.value)) {
+                changed = true;
+                if (entry.present) type->SetUINT32(*entry.key, entry.value);
+                else type->DeleteItem(*entry.key);
+            }
+        }
+        if (changed) {
+            Log(L"NATIVE HDR COLOR ATTRS rejected by decoder; restoring original output type hr=0x%08X",
+                static_cast<unsigned>(hr));
+            hr = g_originalHevcSetOutputType(self, streamId, type, flags);
         }
     }
 
+    if (SUCCEEDED(hr) && (flags & MFT_SET_TYPE_TEST_ONLY) == 0 &&
+        IsNativeHdr10Player() && type) {
+        GUID hdrSubtype{};
+        UINT32 hdrTransfer = 0;
+        UINT32 hdrPrimaries = 0;
+        wchar_t hdrProfile[32]{};
+        const bool nativeHdr10 = !IsDolbyCandidateDecoder(self) &&
+            GetActiveDolbyProfile(self).empty() &&
+            !ReadRendererProfile(type, hdrProfile, _countof(hdrProfile)) &&
+            SUCCEEDED(type->GetGUID(MF_MT_SUBTYPE, &hdrSubtype)) &&
+            hdrSubtype == MFVideoFormat_P010 &&
+            SUCCEEDED(type->GetUINT32(MF_MT_TRANSFER_FUNCTION, &hdrTransfer)) &&
+            hdrTransfer == static_cast<UINT32>(MFVideoTransFunc_2084) &&
+            SUCCEEDED(type->GetUINT32(MF_MT_VIDEO_PRIMARIES, &hdrPrimaries)) &&
+            hdrPrimaries == 9u;
+        InterlockedExchange(&g_hdr10VideoProcessorActive, nativeHdr10 ? 1 : 0);
+        if (nativeHdr10) Log(L"HDR10 VP ROUTE ready source=PLAIN_HEVC_P010");
+    }
+
+    if (SUCCEEDED(hr) && type && IsP010OrNv12(type)) {
+        const std::wstring expected = GetActiveDolbyProfile(self);
+        if (!expected.empty()) {
+            wchar_t actualProfile[32]{};
+            const bool present = ReadRendererProfile(type, actualProfile, _countof(actualProfile));
+            if (!present || _wcsicmp(actualProfile, expected.c_str()) != 0) {
+                const HRESULT profileHr = type->SetString(kRendererExtensionProfile, expected.c_str());
+                Log(L"HEVC output profile corrected expected=%s previous=%s hr=0x%08X",
+                    expected.c_str(), present ? actualProfile : L"<none>", static_cast<unsigned>(profileHr));
+            } else {
+                Log(L"HEVC output carries expected %s", expected.c_str());
+            }
+        }
+    }
+
+    if (SUCCEEDED(hr) && IsMediaPlayerOrMoviesTv()) {
+        LogVideoColorimetry(type, L"HEVC_OUTPUT_ACCEPTED");
+        IMFMediaType* effective = nullptr;
+        if (SUCCEEDED(self->GetOutputCurrentType(streamId, &effective)) && effective) {
+            LogVideoColorimetry(effective, L"HEVC_OUTPUT_EFFECTIVE");
+            effective->Release();
+        }
+    }
     return hr;
 }
 static void InstallHevcDecoderHooks(IMFActivate* activate) {
@@ -6109,9 +6949,50 @@ static HRESULT WINAPI HookMFTEnumEx(
     return hr;
 }
 
-static DWORD WINAPI HookThread(void*) {
-    Sleep(300);
+static HANDLE WINAPI HookCreateFileW(LPCWSTR name, DWORD access, DWORD share,
+    LPSECURITY_ATTRIBUTES security, DWORD creation, DWORD attributes, HANDLE templateFile) {
+    auto original = g_originalCreateFileW;
+    if (!original) return INVALID_HANDLE_VALUE;
+    HANDLE file = original(name, access, share, security, creation, attributes, templateFile);
+    if (file != INVALID_HANDLE_VALUE && name) dvpreflight::RememberFile(file, name);
+    return file;
+}
 
+static HANDLE WINAPI HookCreateFile2(LPCWSTR name, DWORD access, DWORD share,
+    DWORD creation, LPCREATEFILE2_EXTENDED_PARAMETERS extended) {
+    auto original = g_originalCreateFile2;
+    if (!original) return INVALID_HANDLE_VALUE;
+    HANDLE file = original(name, access, share, creation, extended);
+    if (file != INVALID_HANDLE_VALUE && name) dvpreflight::RememberFile(file, name);
+    return file;
+}
+
+static void InstallMediaOpenHooks() {
+    HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
+    if (!kernelBase) return;
+    const auto fileW = reinterpret_cast<void*>(GetProcAddress(kernelBase, "CreateFileW"));
+    if (fileW) {
+        const auto status = MH_CreateHook(fileW, reinterpret_cast<void*>(&HookCreateFileW),
+            reinterpret_cast<void**>(&g_originalCreateFileW));
+        if (status == MH_OK && g_originalCreateFileW) {
+            MH_EnableHook(fileW);
+        }
+    }
+    const auto file2 = reinterpret_cast<void*>(GetProcAddress(kernelBase, "CreateFile2"));
+    if (file2) {
+        const auto status = MH_CreateHook(file2, reinterpret_cast<void*>(&HookCreateFile2),
+            reinterpret_cast<void**>(&g_originalCreateFile2));
+        if (status == MH_OK && g_originalCreateFile2) {
+            MH_EnableHook(file2);
+        }
+    }
+}
+
+static DWORD WINAPI HookThread(void*) {
+    const MH_STATUS earlyInit = MH_Initialize();
+    if (earlyInit == MH_OK || earlyInit == MH_ERROR_ALREADY_INITIALIZED) {
+        InstallMediaOpenHooks();
+    }
     HMODULE mfplat = GetModuleHandleW(L"mfplat.dll");
     if (!mfplat) mfplat = LoadLibraryW(L"mfplat.dll");
     if (!mfplat) {
@@ -6134,7 +7015,12 @@ static DWORD WINAPI HookThread(void*) {
     g_felBridgeEnabled = ReadFelBridgeEnabled(modePath, _countof(modePath));
     g_low6CarrierEnabled = ReadLow6CarrierEnabled(low6ModePath, _countof(low6ModePath));
 
-    Log(L"Version 1.0-beta HDR10 LEFT / Dolby Vision FEL RIGHT; NO L5 MASK + profile isolation + seek/flush reset MFTEnumEx=%p", target);
+    wchar_t executablePath[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, executablePath, _countof(executablePath));
+    const wchar_t* executable = wcsrchr(executablePath, L'\\');
+    executable = executable ? executable + 1 : executablePath;
+    Log(L"Version 1.0-beta HDR10_VP_DISPLAY_METADATA_ADAPT; target=%s MFTEnumEx=%p",
+        executable, target);
     Log(L"FEL BRIDGE MODE=%s modeFile=%s",
         g_felBridgeEnabled ? L"ON" : L"OFF",
         modePath);
@@ -6167,6 +7053,9 @@ static DWORD WINAPI HookThread(void*) {
         Log(L"ERROR: MH_EnableHook=%d (%S)", static_cast<int>(st), MH_StatusToString(st));
         return 5;
     }
+
+    if (IsNativeHdr10Player())
+        InstallHdr10VideoProcessorBridge(&Hdr10VideoProcessorActive, &Hdr10CurrentDisplayPeak, &Log);
 
     Log(L"INLINE HOOK ENABLED original trampoline=%p", reinterpret_cast<void*>(g_originalMFTEnumEx));
     return 0;

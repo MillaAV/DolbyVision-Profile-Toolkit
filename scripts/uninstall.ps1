@@ -29,11 +29,12 @@ if (-not $RootFile) {
     }
 }
 
+$logEnabled = Test-Path -LiteralPath 'C:\ProgramData\MillaAV\P7DV\logging.on' -PathType Leaf
 $log = Join-Path $env:TEMP ('DolbyVision-uninstall-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
 $errors = [Collections.Generic.List[string]]::new()
 function Note([string]$message) {
     Write-Host $message
-    try { Add-Content -LiteralPath $log -Value $message -Encoding UTF8 } catch {}
+    if ($script:logEnabled) { try { Add-Content -LiteralPath $log -Value $message -Encoding UTF8 } catch {} }
 }
 function Remove-Path([string]$target) {
     if (-not (Test-Path -LiteralPath $target)) { return }
@@ -55,7 +56,7 @@ try {
         throw 'Project root verification failed. Nothing was removed.'
     }
     Note ('Uninstalling: ' + $root)
-    Note ('Log: ' + $log)
+    if ($logEnabled) { Note ('Log: ' + $log) }
     $taskNames = @('MillaAV P7 Dolby Vision AutoHook', 'MillaAV Dolby Vision Movies TV AutoHook', 'MillaAV Dolby Vision Player AutoHook')
     foreach ($taskName in $taskNames) {
         $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -92,7 +93,7 @@ try {
     } else { Note 'UNINSTALL COMPLETED.' }
 } catch { Note ('FATAL: ' + $_.Exception.Message) }
 finally {
-    Note ('Log saved to: ' + $log)
+    if ($logEnabled) { Note ('Log saved to: ' + $log) }
     Start-Sleep -Seconds 5
     try { Remove-Item -LiteralPath (Split-Path $RootFile -Parent) -Recurse -Force -ErrorAction SilentlyContinue } catch {}
 }

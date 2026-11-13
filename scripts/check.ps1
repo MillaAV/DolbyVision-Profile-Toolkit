@@ -1,7 +1,13 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 $reportDir = Join-Path $env:LOCALAPPDATA 'DolbyVision-Profile-Enabler'
-New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
 $report = Join-Path $reportDir 'dolby-vision-report.txt'
+$loggingEnabled = Test-Path -LiteralPath 'C:\ProgramData\MillaAV\P7DV\logging.on' -PathType Leaf
+if (-not $loggingEnabled) {
+    Write-Host 'Logging: OFF (default).' -ForegroundColor Yellow
+    Write-Host 'To record playback diagnostics, run LOGGING.cmd, restart the player, and play the video again.'
+    exit 0
+}
+New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
 $results = [System.Collections.Generic.List[string]]::new()
 function Print([string]$message) { Write-Host $message; $script:results.Add($message) }
 function Matches($rows,[string]$pattern) { return @($rows | Where-Object { $_ -match $pattern }).Count }

@@ -6,8 +6,7 @@
       "executables": [
         "Microsoft.Media.Player.exe"
       ],
-      "enabled": true,
-      "status": "Monitored through the unified player hook task"
+      "enabled": true
     },
     {
       "name": "Movies & TV",
@@ -15,8 +14,7 @@
       "executables": [
         "Video.UI.exe"
       ],
-      "enabled": true,
-      "status": "Validated pipeline; FEL still requires independent testing"
+      "enabled": true
     },
     {
       "name": "Photos",
@@ -25,9 +23,8 @@
         "Microsoft.Photos.exe",
         "Photos.exe"
       ],
-      "enabled": true,
-      "status": "Experimental: process detection and loading only, Dolby Vision not validated"
+      "enabled": true
     }
   ],
-  "notes": "All three supported players are monitored by the single player hook task. Existing Microsoft Media Player hook binaries are preserved."
+  "notes": "Unified AutoHook installs and attaches to Microsoft Media Player, Movies & TV and Photos. HEVC preflight timeout is 2000 ms for Media Player and Movies & TV; Photos retains its established native handling."
 }
