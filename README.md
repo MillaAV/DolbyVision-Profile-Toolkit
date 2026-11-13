@@ -6,9 +6,8 @@ DolbyVision Profile Toolkit is an independent, project designed to extend Dolby 
 
 The toolkit focuses on Dolby Vision profile detection, HEVC decoding integration, RPU metadata processing, experimental Profile 7 Enhancement Layer reconstruction, and GPU-assisted video processing.
 
-**Current version:** `1.0-beta`  
 **Platform:** Windows 11 (x64)  
-**Status:** Experimental Public Beta 
+**Status:** Experimental Public Beta
 
 > [!WARNING]
 > This is beta software. Dolby Vision activation, player compatibility, and Profile 7 FEL reconstruction are still experimental. Successful profile detection does not necessarily guarantee reference-accurate playback.
